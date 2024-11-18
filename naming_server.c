@@ -27,7 +27,8 @@
 #define MAX_PATH_LENGTH 256
 #define LRU_CACHE_SIZE 100
 #define LOG_FILE "naming_server.log"
-
+#define PATH_SEPARATOR '/'
+#define MKDIR(dir) mkdir(dir, 0755)
 #define MAX_PATHS 200
 typedef struct
 {
@@ -115,10 +116,10 @@ int send_copy_command(const char *type, const char *src_path, const char *dest_p
 void add_replication_entry();
 void initialize_naming_server();
 void handle_shutdown(int signum);
-
+char *create_path(const char *base, const char *suffix);
 void log_event(const char *format, ...);
 void log_separator(const char *message);
-
+int create_nested_directories(const char *path);
 TrieNode *create_trie_node()
 {
     TrieNode *node = (TrieNode *)calloc(1, sizeof(TrieNode));
@@ -133,40 +134,61 @@ void add_replication_entry()
         {
             if (num_storage_servers > 2 && storage_servers[primary_ss].replicated == 0)
             {
+                int replica1, replica2;
 
-                int replica1 = (primary_ss - 2) % num_storage_servers;
-                int replica2 = (primary_ss - 1) % num_storage_servers;
+                if (primary_ss != (num_storage_servers - 1))
+                {
+                    replica1 = (primary_ss + 2) % num_storage_servers;
+                    replica2 = (primary_ss + 1) % num_storage_servers;
+                }
+                else
+                {
+                    replica1 = (num_storage_servers + primary_ss - 1) % num_storage_servers;
+                    replica2 = (num_storage_servers + primary_ss - 2) % num_storage_servers;
+                }
+
+                storage_servers[primary_ss].replica1 = replica1;
+                storage_servers[primary_ss].replica2 = replica2;
+
                 const char ab[] = "DIR";
-                send_copy_command(ab, storage_servers[primary_ss].accessible_paths[0], storage_servers[replica1].accessible_paths[0]);
-                send_copy_command(ab, storage_servers[primary_ss].accessible_paths[0], storage_servers[replica2].accessible_paths[0]);
+
+                // Helper function for path creation
+
+                // Create paths for replicas
+                char *str1 = create_path(storage_servers[replica1].accessible_paths[0], storage_servers[primary_ss].accessible_paths[0]);
+                char *str2 = create_path(storage_servers[replica2].accessible_paths[0], storage_servers[primary_ss].accessible_paths[0]);
+
+                if (str1 == NULL || str2 == NULL)
+                {
+                    free(str1);
+                    free(str2);
+                    return;
+                }
+
+                // Create directories and replicate data
+                create_nested_directories(str1);
+                create_nested_directories(str2);
+                send_copy_command(ab, storage_servers[primary_ss].accessible_paths[0], str1);
+                send_copy_command(ab, storage_servers[primary_ss].accessible_paths[0], str2);
+
                 storage_servers[primary_ss].replicated = 2;
-            }
-            else if (num_storage_servers == 2 && storage_servers[primary_ss].replicated == 0)
-            {
-                int replica1 = (primary_ss + 1) % num_storage_servers;
-                const char ab[] = "DIR";
-                send_copy_command(ab, storage_servers[primary_ss].accessible_paths[0], storage_servers[replica1].accessible_paths[0]);
-                storage_servers[primary_ss].replicated = 1;
-            }
-            else if (num_storage_servers > 2 && storage_servers[primary_ss].replicated == 1 && primary_ss != (num_storage_servers - 2))
-            {
-                int replica1 = (primary_ss + 2) % num_storage_servers;
-                const char ab[] = "DIR";
-                send_copy_command(ab, storage_servers[primary_ss].accessible_paths[0], storage_servers[replica1].accessible_paths[0]);
-                storage_servers[primary_ss].replicated = 2;
-            }
-            else if (num_storage_servers > 2 && storage_servers[primary_ss].replicated == 1 && primary_ss == (num_storage_servers - 2))
-            {
-                int replica1 = (primary_ss + 1) % num_storage_servers;
-                const char ab[] = "DIR";
-                send_copy_command(ab, storage_servers[primary_ss].accessible_paths[0], storage_servers[replica1].accessible_paths[0]);
-                storage_servers[primary_ss].replicated = 2;
+
+                // Free allocated memory
+                free(str1);
+                free(str2);
             }
         }
     }
+}
+char *create_path(const char *base, const char *suffix)
+{
+    size_t len = strlen(base) + strlen(suffix) + 3; // +3 for "/." and null terminator
+    char *path = malloc(len);
+    if (path == NULL)
+        return NULL;
 
-    // Notify storage servers
-    // replicate_file_to_servers(file_path, primary_ss, replica1, replica2);
+    snprintf(path, len, "%s/.%s", base, suffix + 1);
+    return path;
 }
 void insert_path(const char *path, int server_index)
 {
@@ -392,9 +414,8 @@ int checkifclient(char *buffer)
     char operation[32];
     char path[256];
     sscanf(buffer, "%s %s", operation, path);
-    return (strcmp(operation, "GET_SERVER") == 0 || strcmp(operation, "CREATE") == 0 ||
-            strcmp(operation, "DELETE") == 0 || strcmp(operation, "COPY") == 0 ||
-            strcmp(operation, "STREAM") == 0);
+    return (strcmp(operation, "READ") == 0|| strcmp(operation, "WRITE") == 0 || strcmp(operation, "INFO") == 0 || strcmp(operation, "STREAM") == 0 ||
+     strcmp(operation, "CREATE") == 0 || strcmp(operation, "DELETE") == 0 || strcmp(operation, "COPY") == 0);
 }
 
 void log_event(const char *format, ...)
@@ -1040,6 +1061,11 @@ void *handle_storage_server(int *client_sock_ptr)
         log_event("Error receiving response from Storage Server: %s", strerror(errno));
     }
 
+    if (recv(client_sock, buffer, sizeof(buffer) - 1, 0) <= 0)
+    {
+        storage_servers[server_index].removed = 1;
+        log_event("Storage server %d disconnected", storage_servers[server_index].removed);
+    }
     return NULL;
 }
 
@@ -1069,7 +1095,7 @@ void *handle_client(void *arg)
     int parsed_items = sscanf(buffer, "%31s %511s %511s", command, path, name);
     char response[BUFFER_SIZE];
 
-    if (strcmp(command, "GET_SERVER") == 0)
+    if (strcmp(command, "READ") == 0 || strcmp(command, "WRITE") == 0 || strcmp(command, "INFO") == 0 || strcmp(command, "STREAM") == 0)
     {
         if (parsed_items != 2)
         {
@@ -1088,14 +1114,56 @@ void *handle_client(void *arg)
 
         if (server_index >= 0 && server_index < num_storage_servers)
         {
-            snprintf(response, sizeof(response), "%s %d %d",
-                     storage_servers[server_index].ip,
-                     storage_servers[server_index].port,
-                     storage_servers[server_index].transfer_port);
-            log_event("Sending server info: IP=%s, Port=%d, Transfer Port=%d",
-                      storage_servers[server_index].ip,
-                      storage_servers[server_index].port,
-                      storage_servers[server_index].transfer_port);
+            if (storage_servers[server_index].removed && strcmp(command, "READ") != 0)
+            {
+                snprintf(response, sizeof(response), "ERROR: No such path is accessible on any storage server");
+                log_event("Path not found: %s", path);
+            }
+            else if (storage_servers[server_index].removed)
+            {
+                if (storage_servers[storage_servers[server_index].replica1].removed == 0)
+                {
+                    strcat(path, "/.");
+                    strcat(path, storage_servers[storage_servers[server_index].replica1].accessible_paths[0]);
+                    snprintf(response, sizeof(response), "%s %d %d",
+                             storage_servers[storage_servers[server_index].replica1].ip,
+                             storage_servers[storage_servers[server_index].replica1].port,
+                             storage_servers[storage_servers[server_index].replica1].transfer_port);
+                    log_event("Sending server info: IP=%s, Port=%d, Transfer Port=%d",
+                              storage_servers[storage_servers[server_index].replica1].ip,
+                              storage_servers[storage_servers[server_index].replica1].port,
+                              storage_servers[storage_servers[server_index].replica1].transfer_port);
+                }
+                else if (storage_servers[storage_servers[server_index].replica2].removed == 0)
+                {
+                    strcat(path, "/.");
+                    strcat(path, storage_servers[storage_servers[server_index].replica2].accessible_paths[0]);
+                    snprintf(response, sizeof(response), "%s %d %d",
+                             storage_servers[storage_servers[server_index].replica2].ip,
+                             storage_servers[storage_servers[server_index].replica2].port,
+                             storage_servers[storage_servers[server_index].replica2].transfer_port);
+                    log_event("Sending server info: IP=%s, Port=%d, Transfer Port=%d",
+                              storage_servers[storage_servers[server_index].replica2].ip,
+                              storage_servers[storage_servers[server_index].replica2].port,
+                              storage_servers[storage_servers[server_index].replica2].transfer_port);
+                }
+                else
+                {
+                    snprintf(response, sizeof(response), "ERROR: No such path is accessible on any storage server");
+                    log_event("Path not found: %s", path);
+                }
+            }
+            else
+            {
+                snprintf(response, sizeof(response), "%s %d %d",
+                         storage_servers[server_index].ip,
+                         storage_servers[server_index].port,
+                         storage_servers[server_index].transfer_port);
+                log_event("Sending server info: IP=%s, Port=%d, Transfer Port=%d",
+                          storage_servers[server_index].ip,
+                          storage_servers[server_index].port,
+                          storage_servers[server_index].transfer_port);
+            }
         }
         else
         {
@@ -1182,4 +1250,51 @@ void *handle_client(void *arg)
 
     close(client_sock);
     return NULL;
+}
+int create_nested_directories(const char *path)
+{
+    char buffer[1024];
+    char *p;
+
+    // Copy path to buffer we can modify
+    strncpy(buffer, path, sizeof(buffer) - 1);
+    buffer[sizeof(buffer) - 1] = '\0';
+
+    // Skip leading path separators
+    p = buffer;
+    while (*p == PATH_SEPARATOR)
+        p++;
+
+    // Create each directory in path
+    while (*p != '\0')
+    {
+        // Find next path separator
+        char *next = p;
+        while (*next != '\0' && *next != PATH_SEPARATOR)
+            next++;
+
+        // Temporarily terminate string at current segment
+        char save = *next;
+        *next = '\0';
+
+        // Try to create directory
+        if (MKDIR(buffer) == -1)
+        {
+            if (errno != EEXIST)
+            {
+                // If error is not "directory already exists"
+                printf("Error creating directory %s: %s\n",
+                       buffer, strerror(errno));
+                return -1;
+            }
+        }
+
+        // Restore path separator
+        *next = save;
+
+        // Move to next segment
+        p = (*next == PATH_SEPARATOR) ? next + 1 : next;
+    }
+
+    return 0;
 }

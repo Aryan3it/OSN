@@ -19,7 +19,7 @@
 #include <errno.h>
 #include <stdbool.h>
 
-#define NM_IP "192.168.174.59"
+#define NM_IP "1127.0.0.1"
 #define NM_PORT 8080
 #define BUFFER_SIZE 4096
 #define MAX_COMMAND_LENGTH 1024

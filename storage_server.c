@@ -21,7 +21,7 @@
 #include <signal.h>
 
 #define MAX_PATHS 1000
-#define NM_IP "192.168.174.59"
+#define NM_IP "127.0.0.1"
 #define NM_PORT 8080
 #define BUFFER_SIZE 100000
 #define ASYNC_THRESHOLD 100
